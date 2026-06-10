@@ -479,9 +479,34 @@ tbody tr:hover td{background:rgba(0,155,255,0.04);}
 
 <script>
 // =============================================================================
-// CONFIG — sheet ID + tab names. The frontend reads everything else from Config.
+// CONFIG — published sheet (File → Share → Publish to web). The pub URL
+// returns text/csv with Access-Control-Allow-Origin:*, which gviz/tq does not.
 // =============================================================================
 const SHEET_ID = '1XtEPv71I7UhWZsHvdokS8GLWlDmInHwOsjHjPhlFoLM';
+const PUB_BASE = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQMTA7HNrcaZW6iAG1p-bGS-G-HdkK0TBxTPVnq0rH4OgV5mdkb6D8bGXtpMUjbahuJ8gQUMtSoP3Iz/pub';
+
+// Tab name → published gid. Extracted from the /pubhtml bootstrap so we don't
+// have to maintain it by hand. If the sheet ever republishes with new tabs,
+// update this map and the new tabs become reachable.
+const TAB_GIDS = {
+  'README':                   '1393675861',
+  'Config':                   '1116228956',
+  'Query_Spec':               '2014396504',
+  'Calendar_Map':             '1453034586',
+  'Calendar_Events':          '672103313',
+  'Brand_Marketing_Calendar': '1375856659',
+  'Targets':                  '1532501939',
+  'Raw_GA4_Channels':         '1796811298',
+  'Raw_GA4_Attribution':      '727505869',
+  'Raw_SEM_GoogleAds':        '144926737',
+  'Raw_SEM_Keywords':         '1387855009',
+  'Raw_Social_Meta':          '1837864752',
+  'Raw_SEO_GSC_Queries':      '324423363',
+  'Raw_SEO_GSC_Pages':        '1100249266',
+  'Raw_SEO_Rankings':         '1814127726',
+  'Raw_CRM_Email':            '1103838954',
+};
+
 const TABS = {
   config:    'Config',
   calendar:  'Calendar_Map',
@@ -498,9 +523,12 @@ const TABS = {
 };
 const REQUIRED_TABS = ['config','calendar','targets'];
 
-// gviz CSV URL — works as long as the sheet is "anyone with the link can view".
-// Cache-bust on each fetch so refresh actually pulls fresh data.
-const csvUrl = tab => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}&t=${Date.now()}`;
+// Published-CSV URL. Cache-bust on each fetch so refresh actually pulls fresh data.
+const csvUrl = tab => {
+  const gid = TAB_GIDS[tab];
+  if (!gid) throw new Error(`No gid mapped for tab "${tab}". Update TAB_GIDS in index.html.`);
+  return `${PUB_BASE}?output=csv&single=true&gid=${gid}&t=${Date.now()}`;
+};
 
 // =============================================================================
 // CSV PARSER
@@ -802,7 +830,10 @@ function parseTargets({ objects }){
     const metric   = String(row['Metric']||'').trim();
     const basis    = String(row['Period Basis']||row['PeriodBasis']||'').trim();
     const periodKey= String(row['Period']||row['PeriodKey']||'').trim();
-    const valueRaw = row['Value'] != null ? row['Value'] : row['Amount'];
+    // Sheet ships the column as "Target Value"; tolerate "Value" / "Amount" as fallbacks.
+    const valueRaw = row['Target Value'] != null && row['Target Value'] !== '' ? row['Target Value']
+                   : row['Value']        != null && row['Value']        !== '' ? row['Value']
+                   : row['Amount'];
     if (!scenario || !channel || !metric || !periodKey) continue;
     STATE.targets.push({
       scenario, channel, segment: segment || '', metric, basis: basis || 'AU FY',
@@ -981,19 +1012,27 @@ function entriesForPriorPeriod(){
 // reasonable approximation for monthly plans; we label it as such.
 
 function targetForKey({ scenario, channel, segment, metric, periodKey }){
-  // Exact match first
-  const exact = STATE.targets.find(t =>
-    t.scenario === scenario && t.channel === channel && t.metric === metric &&
-    t.periodKey === periodKey && (segment ? t.segment === segment : true));
-  if (exact) return exact.value;
-  // Without segment (Sitewide etc.)
+  const matchesCore = t =>
+    t.scenario === scenario && t.channel === channel &&
+    t.metric === metric && t.periodKey === periodKey;
+
+  // Specific segment requested: exact match only.
   if (segment){
-    const noSeg = STATE.targets.find(t =>
-      t.scenario === scenario && t.channel === channel && t.metric === metric &&
-      t.periodKey === periodKey && (!t.segment || t.segment === ''));
-    if (noSeg) return noSeg.value;
+    const exact = STATE.targets.find(t => matchesCore(t) && t.segment === segment);
+    return exact ? exact.value : null;
   }
-  return null;
+
+  // No segment requested → prefer the explicit channel total. Targets stores it
+  // as segment="Total" (or blank). Fall back to summing the split-segment rows
+  // (e.g. Paid Search Awareness + Conversion) so we still return the right
+  // channel total even if the sheet doesn't carry an explicit Total row.
+  const totalRow = STATE.targets.find(t => matchesCore(t) &&
+    (t.segment === 'Total' || t.segment === '' || /^all$/i.test(t.segment)));
+  if (totalRow) return totalRow.value;
+
+  const splits = STATE.targets.filter(t => matchesCore(t));
+  if (splits.length === 0) return null;
+  return splits.reduce((s,t) => s + t.value, 0);
 }
 
 function targetForCurrentView(channel, metric, segment){
